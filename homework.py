@@ -2,10 +2,18 @@ import logging
 import os
 import sys
 import time
+from http import HTTPStatus
 
 import requests
 from dotenv import load_dotenv
 from telebot import TeleBot
+
+from exceptions import (
+    ApiConnectionError,
+    EmptyAPIResponseError,
+    MissingRequiredVarsError,
+    IncorrectDataReceivedError
+)
 
 
 load_dotenv()
@@ -14,7 +22,9 @@ logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
+logger = logging.getLogger(__name__)
 stdout_handler = logging.StreamHandler(stream=sys.stdout)
+logger.addHandler(stdout_handler)
 
 PRACTICUM_TOKEN = os.getenv('PRACTICUM_TOKEN')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
@@ -34,16 +44,15 @@ HOMEWORK_VERDICTS = {
 
 def check_tokens():
     """Проверяет наличие всех обязательных переменных."""
-    variables = [('PRACTICUM_TOKEN', PRACTICUM_TOKEN),
-                 ('TELEGRAM_TOKEN', TELEGRAM_TOKEN),
-                 ('TELEGRAM_CHAT_ID', TELEGRAM_CHAT_ID)
-                 ]
-    for name, variable in variables:
+    variables = {'PRACTICUM_TOKEN': PRACTICUM_TOKEN,
+                 'TELEGRAM_TOKEN': TELEGRAM_TOKEN,
+                 'TELEGRAM_CHAT_ID': TELEGRAM_CHAT_ID
+                 }
+    missing_vars = []
+    for name, variable in variables.items():
         if not variable:
-            logging.critical(
-                'Отсутствует обязательная переменная окружения: %s', name
-            )
-            raise ValueError('Missing required variable')
+            missing_vars.append(name)
+    return missing_vars
 
 
 def send_message(bot, message):
@@ -53,9 +62,9 @@ def send_message(bot, message):
             chat_id=TELEGRAM_CHAT_ID,
             text=message,
         )
-        logging.debug(f'Бот отправил сообщение: %s"{message}"')
+        logger.debug('Бот отправил сообщение: %s', message)
     except Exception as error:
-        logging.error(f'Сбой при отправке сообщения: {error}')
+        logger.error('Сбой при отправке сообщения: %s', error)
 
 
 def get_api_answer(timestamp):
@@ -64,57 +73,74 @@ def get_api_answer(timestamp):
         response = requests.get(ENDPOINT, headers=HEADERS, params={
                                 'from_date': timestamp})
     except Exception as error:
-        logging.error(f'Ошибка при запросе к API: {error}')
-    if response.status_code == 200:
-        return response.json()
-    else:
-        logging.ERROR(
-            f'Сбой. Эндпоинт недоступен, код ответа API:'
-            f'{response.status_code}'
-        )
+        logger.error('Ошибка при запросе к API: %s',
+                     error, ENDPOINT, HEADERS)
+    if response.status_code == HTTPStatus.OK:
+        try:
+            return response.json()
+        except Exception as error:
+            logger.error('Сбой приведения ответа к формату dict: %s', error)
+    logger.error(
+        'Сбой. Эндпоинт недоступен, код ответа API: %s',
+        response.status_code
+    )
+    raise ApiConnectionError(
+        'Сбой. Эндпоинт недоступен, код ответа API: ',
+        response.status_code
+    )
 
 
 def check_response(response):
     """Проверяет ответ API на соответствие док-ции."""
     if not isinstance(response, dict):
         raise TypeError(
-            f'Полученный тип данных не соответвтсвует ожидаемому'
-            f' dict: {type(response)}')
+            'Полученный тип данных не соответвтсвует ожидаемому dict: ',
+            type(response))
     if not (
         'homeworks' in response
     ) or not (
         'current_date' in response
     ):
-        raise KeyError
-    try:
-        if response['homeworks']:
-            for homework in response['homeworks']:
-                if homework['status'] not in HOMEWORK_VERDICTS:
-                    hw_status = homework['status']
-                    logging.error(
-                        f'Неожиданный статус домашней работы: {hw_status}')
-        else:
-            logging.debug('Отсутствие в ответе новых статусов')
-    except Exception as error:
-        logging.error(f'отсутствие ожидаемых ключей в ответе API: {error}')
-        raise error
+        logger.error('отсутствие ожидаемых ключей в ответе API: %s',
+                     EmptyAPIResponseError
+                     )
+        raise EmptyAPIResponseError
+    if not isinstance(response['homeworks'], list):
+        raise TypeError
+    homeworks = response['homeworks']
+    if not homeworks:
+        logger.debug('Отсутствие в ответе новых статусов')
 
 
 def parse_status(homework):
     """Возвращает message - строку для отправки пользователю."""
-    try:
-        homework_name = homework['homework_name']
-        hw_status = homework['status']
-        verdict = HOMEWORK_VERDICTS[hw_status]
-        return f'Изменился статус проверки работы "{homework_name}". {verdict}'
-    except Exception as error:
-        logging.error(f'При извлечении статуса произошла ошибка: {error}')
-        raise error('При извлечении статуса произошла ошибка')
+    if 'homework_name' not in homework or 'status' not in homework:
+        logger.error('Отсутствуют данные статуса/названия в ответе',
+                     EmptyAPIResponseError
+                     )
+        raise EmptyAPIResponseError(
+            'Отсутствуют данные статуса/названия в ответе')
+    hw_status = homework['status']
+    if hw_status not in HOMEWORK_VERDICTS:
+        logger.error('Получен недействительный статус: ',
+                     IncorrectDataReceivedError
+                     )
+        raise IncorrectDataReceivedError
+    homework_name = homework['homework_name']
+    verdict = HOMEWORK_VERDICTS[hw_status]
+    return f'Изменился статус проверки работы "{homework_name}". {verdict}'
 
 
 def main():
     """Основная логика работы бота."""
-    check_tokens()
+    if checker := check_tokens():
+        logger.critical(
+            'Отсутствуют обязательные переменные окружения: %s', checker
+        )
+        raise MissingRequiredVarsError(
+            'Отсутствуют обязательные переменные окружения',
+            checker
+        )
 
     # Создаем объект класса бота
     bot = TeleBot(token=TELEGRAM_TOKEN)
